@@ -60,8 +60,8 @@ class SimilarityService:
         return image
 
     # ------------------------------------------------------------------
-    # Etapa 1: funciones a implementar
-    # ------------------------------------------------------------------
+    #                  Etapa 1: funciones a implementar 
+    # ----------------                                  ----------------
 
     def extract_embedding(self, image: np.ndarray) -> list[float]:
         """
@@ -139,6 +139,10 @@ class SimilarityService:
         breed = max(votes, key=votes.get)
         score = max(n.score for n in results if n.breed == breed)
         return breed, score
+
+    # ----------------                                  ----------------
+    #                  Etapa 1: funciones a implementar 
+    # ------------------------------------------------------------------
 
 
 
