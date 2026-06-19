@@ -46,6 +46,59 @@ class ResNet18Classifier(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.head(self.embed(x))         # [B, num_classes]
 
+# ------------------------------------------------------------------
+#         Nuestro Modelo propio (CNN entrenada desde cero): 
+# --------                                                 ---------
+class CustomCNNClassifier(nn.Module):
+    """CNN propia entrenada desde cero, con la misma interfaz que ResNet18Classifier.
+
+    forward(x) -> logits [B, num_classes]   (entrenamiento / evaluacion)
+    embed(x)   -> features [B, 512]         (extract_custom_embedding / Etapa 1)
+
+    El 'backbone' (5 bloques conv + global average pooling) termina en 512 features,
+    igual que ResNet18 -> intercambiable y compatible con pgvector (EMBEDDING_DIM=512).
+    Usa los mismos nombres backbone/head que ResNet18Classifier para integrarse con _fit.
+    """
+
+    def __init__(self, num_classes: int, dropout: float = 0.3) -> None:
+        super().__init__()
+
+        def block(in_ch: int, out_ch: int) -> nn.Sequential:
+            # Convolucion (detecta patrones) + BatchNorm (estabiliza el entreno desde
+            # cero) + ReLU (no linealidad) + MaxPool (achica el tamano a la mitad).
+            return nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1),
+                nn.BatchNorm2d(out_ch),
+                nn.ReLU(inplace=True),
+                nn.MaxPool2d(2),
+            )
+
+        # backbone: imagen 3x224x224 -> 512 numeros.
+        self.backbone = nn.Sequential(
+            block(3, 32),              # 224 -> 112
+            block(32, 64),             # 112 -> 56
+            block(64, 128),            # 56  -> 28
+            block(128, 256),           # 28  -> 14
+            block(256, 512),           # 14  -> 7
+            nn.AdaptiveAvgPool2d(1),   # promedia cada mapa 7x7 -> 512x1x1
+            nn.Flatten(),              # -> [B, 512]  (este es el embedding)
+        )
+        # head: regularizacion + capa lineal a las 70 razas.
+        self.head = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Linear(512, num_classes),
+        )
+
+    def embed(self, x: torch.Tensor) -> torch.Tensor:
+        return self.backbone(x)              # [B, 512]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.head(self.backbone(x))   # [B, num_classes]
+
+# --------                                                 ---------
+#         Nuestro Modelo propio (CNN entrenada desde cero): 
+# ------------------------------------------------------------------
+
 class AlbumentationsImageFolder(ImageFolder):
     """ImageFolder que lee con OpenCV (BGR) y aplica una transform de albumentations.
 
@@ -315,20 +368,21 @@ class ClassifierService:
         if self.active_model_name == "resnet18_finetuned":
             return ResNet18Classifier(num_classes=num_classes, pretrained=True)
         if self.active_model_name == "cnn_custom":
-            raise NotImplementedError("CNN custom: pendiente (Modelo B)")
+            return CustomCNNClassifier(num_classes=num_classes)
         raise ValueError(f"Modelo desconocido: {self.active_model_name}")
-
 
     # ------------------------------------------------------------------
     #                   Etapa 2: Métodos a implementar
     # -----------------                                  ---------------
 
     def train_classifier(self) -> dict:
-        """Entrena el modelo activo (resnet18_finetuned o cnn_custom) y guarda el mejor.
+        """
+        Entrena el modelo activo (resnet18_finetuned o cnn_custom) y guarda el mejor.
 
-        Orquesta los ladrillos ya definidos:
+        Orquesta las herramientas ya definidas:
           _build_dataloaders -> _build_model -> _fit.
-        Los hiperparametros viven en _fit (defaults documentados).
+        Elige los hiperparametros segun el modelo (ver abajo) y se los pasa a _fit,
+        que no necesita saber que modelo es.
         El mejor modelo (por val accuracy) lo guarda _fit en self.active_checkpoint.
         Deja el historial en self.history para graficar las curvas en la notebook.
         """
@@ -338,10 +392,20 @@ class ClassifierService:
         logger.info("Entrenando '%s' | %d clases | device=%s",
                     self.active_model_name, len(classes), self.device)
 
-        self.history = self._fit(model, train_loader, valid_loader, classes)
-        return self.history
+        # Hiperparametros segun el tipo de modelo:
+        #  - resnet18_finetuned: viene pre-entrenado -> LR diferencial (cuerpo lento
+        #    para no arruinar ImageNet, cabeza rapida) + warmup con el cuerpo congelado.
+        #  - cnn_custom: se entrena desde cero -> un unico LR normal para toda la red,
+        #    sin congelar (no hay pesos previos que preservar) y mas epocas.
+        if self.active_model_name == "cnn_custom":
+            fit_kwargs = dict(epochs=30, lr_backbone=1e-3, lr_head=1e-3,
+                              warmup_epochs=0, weight_decay=1e-4)
+        else:
+            fit_kwargs = dict(epochs=20, lr_backbone=1e-4, lr_head=1e-3,
+                              warmup_epochs=2, weight_decay=1e-4)
 
-# --- dentro de ClassifierService ---
+        self.history = self._fit(model, train_loader, valid_loader, classes, **fit_kwargs)
+        return self.history
 
     def evaluate_classifier(self) -> dict[str, float]:
         """Evalua el modelo activo sobre el test set.
